@@ -16,7 +16,7 @@ spec:
     spec:
       automountServiceAccountToken: false
       nodeSelector:
-        kubernetes.azure.com/aks-local-ssd: "true"
+        agentpool: infras
       priorityClassName: system-node-critical
       containers:
         - name: aks-nvme-ssd-provisioner
