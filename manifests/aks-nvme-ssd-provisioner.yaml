@@ -25,9 +25,6 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
-            - mountPath: /pv-disks
-              name: pv-disks
-              mountPropagation: "Bidirectional"
             - mountPath: /hx-disks
               name: hx-disks
               mountPropagation: "Bidirectional"
@@ -35,6 +32,3 @@ spec:
         - name: hx-disks
           hostPath:
             path: /hx-disks
-        - name: pv-disks
-          hostPath:
-            path: /pv-disks
