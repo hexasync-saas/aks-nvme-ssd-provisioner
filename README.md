@@ -24,3 +24,7 @@ To benchmark, run:
 ```
 kubectl apply -f bench.yaml
 ```
+
+```
+kubectl apply -f ./manifests/aks-nvme-ssd-provisioner.yaml
+```
