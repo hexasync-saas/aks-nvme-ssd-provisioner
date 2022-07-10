@@ -20,7 +20,7 @@ spec:
       priorityClassName: system-node-critical
       containers:
         - name: aks-nvme-ssd-provisioner
-          image: registry.sandbox.beehexa.com/hexasync/aks-nvme-ssd-provisioner:202207100827
+          image: registry.sandbox.beehexa.com/hexasync/aks-nvme-ssd-provisioner:202207100841
           imagePullPolicy: Always
           securityContext:
             privileged: true
