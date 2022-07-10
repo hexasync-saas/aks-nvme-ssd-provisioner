@@ -20,15 +20,15 @@ spec:
       priorityClassName: system-node-critical
       containers:
         - name: aks-nvme-ssd-provisioner
-          image: ams0/aks-nvme-ssd-provisioner:v1.0.0
+          image: registry.sandbox.beehexa.com/hexasync/aks-nvme-ssd-provisioner:202207100827
           imagePullPolicy: Always
           securityContext:
             privileged: true
           volumeMounts:
-            - mountPath: /pv-disks
-              name: pv-disks
+            - mountPath: /hx-disks
+              name: hx-disks
               mountPropagation: "Bidirectional"
       volumes:
-        - name: pv-disks
+        - name: hx-disks
           hostPath:
-            path: /pv-disks
+            path: /hx-disks

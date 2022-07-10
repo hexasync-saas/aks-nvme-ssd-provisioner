@@ -14,10 +14,10 @@ STRIPE_WIDTH=$(expr $SSD_NVME_DEVICE_COUNT \* $STRIDE || true)
 
 
 # Checking if provisioning already happend
-if [[ "$(ls -A /pv-disks)" ]]
+if [[ "$(ls -A /hx-disks)" ]]
 then
-  echo 'Volumes already present in "/pv-disks"'
-  echo -e "\n$(ls -Al /pv-disks | tail -n +2)\n"
+  echo 'Volumes already present in "/hx-disks"'
+  echo -e "\n$(ls -Al /hx-disks | tail -n +2)\n"
   echo "I assume that provisioning already happend, doing nothing!"
   sleep infinity
 fi
@@ -47,9 +47,9 @@ case $SSD_NVME_DEVICE_COUNT in
 esac
 
 UUID=$(blkid -s UUID -o value $DEVICE)
-mkdir -p /pv-disks/$UUID
-mount -o defaults,noatime,discard,nobarrier --uuid $UUID /pv-disks/$UUID
-echo "Device $DEVICE has been mounted to /pv-disks/$UUID"
+mkdir -p /hx-disks
+mount -o defaults,noatime,discard,nobarrier --uuid $UUID /hx-disks
+echo "Device $DEVICE has been mounted to /hx-disks"
 echo "NVMe SSD provisioning is done and I will go to sleep now"
 
 #sleep infinity
