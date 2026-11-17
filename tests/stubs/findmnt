@@ -1,0 +1,4 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+[[ -s "$STATE/mount" ]] || exit 1
+cat "$STATE/mount"

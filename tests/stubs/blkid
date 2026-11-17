@@ -1,0 +1,5 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+dev=${!#}; f="$STATE/fs/${dev##*/}"
+if [[ "$*" == *"-s UUID"* ]]; then echo "uuid-${dev##*/}"; exit 0; fi
+[[ -s "$f" ]] && { cat "$f"; exit 0; }; exit 2

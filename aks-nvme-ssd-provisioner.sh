@@ -35,7 +35,8 @@ for dev in $ALL_NVME; do
     CHILD_COUNT=$(lsblk -nlo NAME "$dev" | wc -l)
     
     # C. Check for existing Filesystem or Mountpoint
-    HAS_FS=$(lsblk -no FSTYPE "$dev" | tr -d '[:space:]')
+    # lsblk FSTYPE is always empty in the container (no udev db); blkid -p reads the disk.
+    HAS_FS=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)
     IS_MOUNTED=$(lsblk -no MOUNTPOINT "$dev" | tr -d '[:space:]')
 
     if [[ "$CHILD_COUNT" -eq 1 ]] && [[ -z "$HAS_FS" ]] && [[ -z "$IS_MOUNTED" ]]; then
@@ -43,17 +44,24 @@ for dev in $ALL_NVME; do
         UNUSED_DISKS+=("$dev")
     else
         echo "   [SKIP] $dev: Contains partitions or active filesystem."
+        IN_USE_COUNT=$((${IN_USE_COUNT:-0} + 1))
     fi
 done
 
 SSD_NVME_DEVICE_COUNT=${#UNUSED_DISKS[@]}
 
+if [[ $SSD_NVME_DEVICE_COUNT -gt 0 ]] && [[ ${IN_USE_COUNT:-0} -gt 0 ]]; then
+    echo "ERROR: some NVMe disks are blank and some are in use; refusing to format. Check the disks by hand."
+    exit 1
+fi
+
 # --- 2. PRE-FLIGHT CHECKS ---
 if [[ $SSD_NVME_DEVICE_COUNT -eq 0 ]]; then
     echo "No unused NVMe disks found."
     
-    # Verify if we are already mounted to a RAID device
-    if mountpoint -q "$MOUNT_POINT"; then
+    # Verify if we are already mounted to a RAID device.
+    # Not "mountpoint -q": /hx-disks is a hostPath volume, so it is always a mountpoint here.
+    if findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT" | grep -q '^/dev/md'; then
         echo "Notice: $MOUNT_POINT is already mounted. Checking capacity..."
         df -h "$MOUNT_POINT"
         
@@ -64,7 +72,21 @@ if [[ $SSD_NVME_DEVICE_COUNT -eq 0 ]]; then
         fi
         sleep infinity
     fi
-    exit 0
+
+    # The RAID exists but is not mounted (node reboot, pod restart): mount it, never format it.
+    mdadm --assemble --scan || true
+    TARGET_DEV=$(lsblk -pnro NAME,TYPE | awk '$2 ~ /^raid/ {print $1}' | sort -u | head -n 1)
+    if [[ -z "$TARGET_DEV" ]] || [[ "$(blkid -p -s TYPE -o value "$TARGET_DEV" 2>/dev/null || true)" != "ext4" ]]; then
+        echo "ERROR: no ext4 RAID device to mount and no blank disk to format. Check the disks by hand."
+        exit 1
+    fi
+    echo "Found existing RAID $TARGET_DEV: mounting it (no format)..."
+    chattr +i "$MOUNT_POINT" || true   # nothing can write to the OS disk under the mountpoint
+    mount "$TARGET_DEV" "$MOUNT_POINT" -o defaults,noatime,discard
+    chmod 777 "$MOUNT_POINT"
+    findmnt "$MOUNT_POINT"
+    kubectl label node "$NODE_NAME" nvme-storage-ready=true --overwrite || echo "Labeling failed, continuing..."
+    sleep infinity
 fi
 
 echo "Step 2: Found $SSD_NVME_DEVICE_COUNT devices to use: ${UNUSED_DISKS[*]}"
@@ -118,8 +140,9 @@ fi
 
 mkdir -p "$MOUNT_POINT"
 
-# Unmount any "ghost" mounts from previous failed attempts
-umount -l "$MOUNT_POINT" || true
+# Do NOT "umount -l $MOUNT_POINT" here: inside the container that removes the hostPath
+# mount itself, and the RAID would then be mounted in the container only, not on the host.
+chattr +i "$MOUNT_POINT" || true   # nothing can write to the OS disk under the mountpoint
 
 echo "   Mounting UUID=$DEVICE_UUID to $MOUNT_POINT..."
 mount -U "$DEVICE_UUID" "$MOUNT_POINT" -o defaults,noatime,discard

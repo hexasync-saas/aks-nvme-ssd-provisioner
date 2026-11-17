@@ -1,0 +1,4 @@
+#!/bin/bash
+# In the container /hx-disks is a hostPath volume, so mountpoint always says yes.
+. "$(dirname "$0")/_lib"; record "$@"
+exit 0

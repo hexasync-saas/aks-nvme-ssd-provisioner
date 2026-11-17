@@ -1,0 +1,10 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+case "$1" in
+  --assemble) [[ -n "$(raid)" ]] && exit 2
+              for d in $(members); do [[ -e "$STATE/sb/${d##*/}" ]] || exit 2; done
+              echo /dev/md127 > "$STATE/raid" ;;
+  --create)   echo "$2" > "$STATE/raid" ;;
+  --detail)   echo "State : clean" ;;
+esac
+exit 0
