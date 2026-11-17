@@ -1,0 +1,5 @@
+#!/bin/bash
+# Removes the top mount on /hx-disks in the container's view (umount -l takes the hostPath bind).
+. "$(dirname "$0")/_lib"; record "$@"
+[[ "${!#}" == /hx-disks && -s "$STATE/mount" ]] && sed -i '$d' "$STATE/mount"
+exit 0

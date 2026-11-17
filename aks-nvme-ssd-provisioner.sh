@@ -12,6 +12,57 @@ MOUNT_POINT="/hx-disks"
 # NODE_NAME is passed from the Downward API in the DaemonSet spec
 NODE_NAME=${NODE_NAME:-""}
 
+# --- HOST VIEW ---
+# Inside the pod, /hx-disks is a hostPath bind, so the container's own mount table cannot tell
+# "mounted on the host" from "mounted in this container only" (image 202602281131 printed
+# SUCCESS for a mount the host never saw). PID 1 is the host's init (hostPID: true), so
+# "findmnt -N 1" reads the host's mount table. Without hostPID every check below would
+# silently fall back to the container's view, so refuse to run.
+if [[ "$(readlink /proc/1/ns/mnt)" == "$(readlink /proc/self/ns/mnt)" ]]; then
+    echo "ERROR: cannot see the host mount table (the DaemonSet needs hostPID: true)."
+    exit 1
+fi
+
+# True when the host has a whole data device (md RAID, or one raw NVMe disk) mounted on
+# $MOUNT_POINT. When the mount is missing, the host has no entry at all: /hx-disks is then
+# a plain directory on the OS disk.
+host_disk_mounted() {
+    findmnt -N 1 -rn -o SOURCE --mountpoint "$MOUNT_POINT" | tail -n 1 \
+        | grep -Eq '^/dev/(md[0-9]+|nvme[0-9]+n[0-9]+)$'
+}
+
+# Exit 1 unless the mount just made is visible on the host.
+require_host_mount() {
+    if ! host_disk_mounted; then
+        echo "ERROR: $MOUNT_POINT is mounted in this container but NOT on the host; Longhorn would use the OS disk."
+        exit 1
+    fi
+    echo "   Verified on the host: $(findmnt -N 1 -rn -o SOURCE --mountpoint "$MOUNT_POINT" | tail -n 1) on $MOUNT_POINT"
+}
+
+# Label only after the host mount is verified. With the Longhorn setting
+# create-default-disk-labeled-nodes=true, Longhorn creates its disk on /hx-disks only once
+# node.longhorn.io/create-default-disk=true is set, instead of racing the provisioner and
+# writing its disk config to the OS-disk directory.
+label_node() {
+    if [[ -z "$NODE_NAME" ]]; then
+        echo "   [SKIP] NODE_NAME env var not set. Cannot label node."
+        return 0
+    fi
+    # A missing label means Longhorn never creates the disk, so fail and let the pod retry:
+    # the restarted pod finds the host mount and only relabels.
+    if ! kubectl label node "$NODE_NAME" nvme-storage-ready=true node.longhorn.io/create-default-disk=true --overwrite; then
+        echo "ERROR: labeling node $NODE_NAME failed."
+        exit 1
+    fi
+}
+
+# Readiness probe: ready only while the host has the disk mounted on $MOUNT_POINT.
+if [[ "${1:-}" == "--check" ]]; then
+    if host_disk_mounted; then exit 0; fi
+    exit 1
+fi
+
 echo "-----------------------------------------------------------"
 echo "Starting Hexasync NVMe SSD Provisioner (UUID Mode)..."
 echo "Target Node: ${NODE_NAME:-Unknown}"
@@ -35,7 +86,8 @@ for dev in $ALL_NVME; do
     CHILD_COUNT=$(lsblk -nlo NAME "$dev" | wc -l)
     
     # C. Check for existing Filesystem or Mountpoint
-    HAS_FS=$(lsblk -no FSTYPE "$dev" | tr -d '[:space:]')
+    # lsblk FSTYPE is always empty in the container (no udev db); blkid -p reads the disk.
+    HAS_FS=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)
     IS_MOUNTED=$(lsblk -no MOUNTPOINT "$dev" | tr -d '[:space:]')
 
     if [[ "$CHILD_COUNT" -eq 1 ]] && [[ -z "$HAS_FS" ]] && [[ -z "$IS_MOUNTED" ]]; then
@@ -43,28 +95,45 @@ for dev in $ALL_NVME; do
         UNUSED_DISKS+=("$dev")
     else
         echo "   [SKIP] $dev: Contains partitions or active filesystem."
+        IN_USE_COUNT=$((${IN_USE_COUNT:-0} + 1))
     fi
 done
 
 SSD_NVME_DEVICE_COUNT=${#UNUSED_DISKS[@]}
 
+if [[ $SSD_NVME_DEVICE_COUNT -gt 0 ]] && [[ ${IN_USE_COUNT:-0} -gt 0 ]]; then
+    echo "ERROR: some NVMe disks are blank and some are in use; refusing to format. Check the disks by hand."
+    exit 1
+fi
+
 # --- 2. PRE-FLIGHT CHECKS ---
 if [[ $SSD_NVME_DEVICE_COUNT -eq 0 ]]; then
     echo "No unused NVMe disks found."
     
-    # Verify if we are already mounted to a RAID device
-    if mountpoint -q "$MOUNT_POINT"; then
-        echo "Notice: $MOUNT_POINT is already mounted. Checking capacity..."
+    # Already mounted on the HOST? Not "mountpoint -q" and not the container's findmnt:
+    # /hx-disks is a hostPath volume, so it is always a mountpoint in here.
+    if host_disk_mounted; then
+        echo "Notice: $MOUNT_POINT is already mounted on the host. Checking capacity..."
         df -h "$MOUNT_POINT"
-        
-        # Even if already mounted, try to ensure the label exists
-        if [[ -n "$NODE_NAME" ]]; then
-             echo "Ensuring node label is present..."
-             kubectl label node "$NODE_NAME" nvme-storage-ready=true --overwrite || echo "Labeling failed, continuing..."
-        fi
+        echo "Ensuring node label is present..."
+        label_node
         sleep infinity
     fi
-    exit 0
+
+    # The RAID exists but is not mounted (node reboot, pod restart): mount it, never format it.
+    mdadm --assemble --scan || true
+    TARGET_DEV=$(lsblk -pnro NAME,TYPE | awk '$2 ~ /^raid/ {print $1}' | sort -u | head -n 1)
+    if [[ -z "$TARGET_DEV" ]] || [[ "$(blkid -p -s TYPE -o value "$TARGET_DEV" 2>/dev/null || true)" != "ext4" ]]; then
+        echo "ERROR: no ext4 RAID device to mount and no blank disk to format. Check the disks by hand."
+        exit 1
+    fi
+    echo "Found existing RAID $TARGET_DEV: mounting it (no format)..."
+    chattr +i "$MOUNT_POINT" || true   # nothing can write to the OS disk under the mountpoint
+    mount "$TARGET_DEV" "$MOUNT_POINT" -o defaults,noatime,discard
+    chmod 777 "$MOUNT_POINT"
+    require_host_mount
+    label_node
+    sleep infinity
 fi
 
 echo "Step 2: Found $SSD_NVME_DEVICE_COUNT devices to use: ${UNUSED_DISKS[*]}"
@@ -118,28 +187,20 @@ fi
 
 mkdir -p "$MOUNT_POINT"
 
-# Unmount any "ghost" mounts from previous failed attempts
-umount -l "$MOUNT_POINT" || true
+# Do NOT "umount -l $MOUNT_POINT" here: inside the container that removes the hostPath
+# mount itself, and the RAID would then be mounted in the container only, not on the host.
+chattr +i "$MOUNT_POINT" || true   # nothing can write to the OS disk under the mountpoint
 
 echo "   Mounting UUID=$DEVICE_UUID to $MOUNT_POINT..."
 mount -U "$DEVICE_UUID" "$MOUNT_POINT" -o defaults,noatime,discard
 
 # Ensure pods have write access
 chmod 777 "$MOUNT_POINT"
+require_host_mount
 
 # --- 5. NODE LABELING ---
 echo "Step 7: Labeling node in Kubernetes..."
-if [[ -n "$NODE_NAME" ]]; then
-    if command -v kubectl >/dev/null 2>&1; then
-        echo "   Labeling node $NODE_NAME with nvme-storage-ready=true..."
-        kubectl label node "$NODE_NAME" nvme-storage-ready=true --overwrite
-    else
-        echo "   [WARNING] kubectl not found in container. Skipping labeling."
-        echo "   Ensure your Dockerfile installs kubectl to enable this feature."
-    fi
-else
-    echo "   [SKIP] NODE_NAME env var not set. Cannot label node."
-fi
+label_node
 
 echo "-----------------------------------------------------------"
 echo "SUCCESS: Device UUID $DEVICE_UUID mounted at $MOUNT_POINT"

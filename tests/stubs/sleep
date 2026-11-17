@@ -1,0 +1,4 @@
+#!/bin/bash
+# "sleep infinity" = the script reached its idle state: stop it here.
+. "$(dirname "$0")/_lib"; record "$@"
+kill -TERM "$PPID"

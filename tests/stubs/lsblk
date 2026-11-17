@@ -1,0 +1,10 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+case "$1" in
+  -pnro) echo "/dev/nvme0n1 disk"; echo "/dev/nvme0n1p1 part"
+         for d in $(members); do echo "$d disk"; [[ -n "$(raid)" ]] && echo "$(raid) raid0"; done ;;
+  -nlo)  echo "${3##*/}"; [[ "$3" == /dev/nvme0n1 ]] && echo nvme0n1p1
+         [[ -n "$(raid)" && "$3" != /dev/nvme0n1 ]] && echo "$(basename "$(raid)")" ;;
+  -no)   [[ "$3" == /dev/nvme0n1 ]] && echo "/" ;;
+esac
+exit 0

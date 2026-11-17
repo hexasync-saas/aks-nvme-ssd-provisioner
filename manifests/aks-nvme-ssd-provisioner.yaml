@@ -44,6 +44,7 @@ spec:
     spec:
       serviceAccountName: nvme-provisioner-sa
       automountServiceAccountToken: true # Must be true to label nodes
+      hostPID: true # The script reads the host's mount table (findmnt -N 1) to verify /hx-disks
       nodeSelector:
         agentpool: nvme
       priorityClassName: system-node-critical
@@ -58,6 +59,13 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: spec.nodeName
+          # Ready only while the HOST has the NVMe disk mounted on /hx-disks.
+          readinessProbe:
+            exec:
+              command: ["aks-nvme-ssd-provisioner.sh", "--check"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 2
           volumeMounts:
             - mountPath: /hx-disks
               name: hx-disks

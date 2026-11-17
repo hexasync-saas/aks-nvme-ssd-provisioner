@@ -1,0 +1,4 @@
+# Shared by the stubs. Disk state lives in $STATE; every call is appended to $STATE/calls.
+record() { echo "$(basename "$0") $*" >> "$STATE/calls"; }
+raid() { cat "$STATE/raid" 2>/dev/null; }              # active array, e.g. /dev/md0
+members() { cat "$STATE/members"; }                     # local NVMe disks
