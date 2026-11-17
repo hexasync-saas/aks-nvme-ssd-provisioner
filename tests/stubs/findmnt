@@ -1,4 +1,7 @@
 #!/bin/bash
+# Answers only for the exact mountpoint asked with --mountpoint, like the real findmnt -M.
 . "$(dirname "$0")/_lib"; record "$@"
-[[ -s "$STATE/mount" ]] && cat "$STATE/mount"
+mp=""
+while (( $# )); do [[ "$1" == "--mountpoint" ]] && { mp=$2; shift; }; shift; done
+[[ -n "$mp" && "$mp" == "$(cat "$STATE/mountpoint" 2>/dev/null)" && -s "$STATE/mount" ]] && cat "$STATE/mount"
 exit 0

@@ -70,4 +70,5 @@ spec:
             exec:
               command: ["aks-nvme-ssd-provisioner.sh", "--check"]
             periodSeconds: 30
+            timeoutSeconds: 5
             failureThreshold: 2

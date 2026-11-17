@@ -36,11 +36,12 @@ EXPECTED_DEVICE=""
 # Prefix that runs a command in the host mount namespace.
 read -r -a HOST <<< "${HOST_EXEC-nsenter -t 1 -m --}"
 
-log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
+# To stderr, so a log line never ends up in a captured $(...) value.
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 
 label_node() {
     [[ -n "$NODE_NAME" ]] || return 0
-    kubectl label node "$NODE_NAME" "$1" --overwrite >/dev/null || log "WARNING: could not set node label '$1'"
+    kubectl label node "$NODE_NAME" "$1" --overwrite --request-timeout=10s >/dev/null || log "WARNING: could not set node label '$1'"
 }
 
 die() {
@@ -54,7 +55,7 @@ die() {
 find_local_disks() {
     local dir model
     for dir in "$SYSFS"/block/nvme*n1; do
-        model=$(tr -s ' ' < "$dir/device/model" | sed 's/ *$//')
+        model=$(tr -s ' ' < "$dir/device/model" | sed 's/ *$//') || return 1
         if [[ "$model" == "$NVME_MODEL"* ]]; then
             echo "/dev/${dir##*/}"
         fi
@@ -90,7 +91,8 @@ has_partitions() {
 # database, which the container does not have, so it always reads empty here.
 signature() { blkid -p -s TYPE -o value "$1" 2>/dev/null || true; }
 
-host_mount_source() { "${HOST[@]}" findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT" 2>/dev/null || true; }
+# Topmost mount at $MOUNT_POINT (findmnt lists stacked mounts bottom-up), empty if none.
+host_mount_source() { "${HOST[@]}" findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT" 2>/dev/null | tail -n 1 || true; }
 
 expected_device() {
     local disks=("$@") array
@@ -143,6 +145,11 @@ prepare_device() {
         return 0
     fi
 
+    if (( ${#disks[@]} == 1 )) && [[ "$(signature "${disks[0]}")" == "ext4" ]]; then
+        log "Single disk ${disks[0]} already holds ext4 (no format)"
+        return 0
+    fi
+
     for disk in "${disks[@]}"; do
         if mdadm --examine "$disk" >/dev/null 2>&1; then with_superblock=$((with_superblock + 1)); fi
     done
@@ -163,14 +170,6 @@ mount_on_host() {
     fstype=$(signature "$device")
     [[ "$fstype" == "ext4" ]] || die "$device holds '${fstype:-no filesystem}', expected ext4; refusing to format existing data"
 
-    source=$(host_mount_source)
-    if [[ -n "$source" ]]; then
-        die "$MOUNT_POINT on the host is mounted from $source, not from $device; refusing to touch it"
-    fi
-
-    "${HOST[@]}" mkdir -p "$MOUNT_POINT"
-    # Immutable while unmounted: a write that would land on the OS disk now fails.
-    "${HOST[@]}" chattr +i "$MOUNT_POINT" || log "WARNING: could not make $MOUNT_POINT immutable"
     "${HOST[@]}" mount -o defaults,noatime,discard "$device" "$MOUNT_POINT"
     is_mounted_correctly "$device" || die "mounted $device but the host reports $MOUNT_POINT from '$(host_mount_source)'"
     "${HOST[@]}" chmod 777 "$MOUNT_POINT"
@@ -178,15 +177,43 @@ mount_on_host() {
 }
 
 # Sets EXPECTED_DEVICE to the device mounted at $MOUNT_POINT.
+# Runs while nothing is mounted at $MOUNT_POINT on the host, before anything that can
+# fail: from here on a write to $MOUNT_POINT fails instead of landing on the OS disk.
+guard_mountpoint() {
+    local leftovers
+    "${HOST[@]}" mkdir -p "$MOUNT_POINT"
+    "${HOST[@]}" chattr +i "$MOUNT_POINT" || log "WARNING: could not make $MOUNT_POINT immutable"
+    # Mounting hides what is already in the directory. Longhorn replicas written onto
+    # the OS disk must be moved off first, not silently shadowed.
+    if [[ -n "$("${HOST[@]}" find "$MOUNT_POINT/replicas" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+        die "$MOUNT_POINT/replicas on the OS disk is not empty; move those Longhorn replicas off this node before mounting"
+    fi
+    leftovers=$("${HOST[@]}" ls -A "$MOUNT_POINT" 2>/dev/null | tr '\n' ' ')
+    [[ -z "$leftovers" ]] || log "WARNING: mounting over files on the OS disk, which become hidden: $leftovers"
+}
+
+local_disks() {
+    local out
+    out=$(find_local_disks) || die "could not read the model of the NVMe disks under $SYSFS/block"
+    [[ -n "$out" ]] || die "no NVMe disk with model '$NVME_MODEL' found"
+    echo "$out"
+}
+
 ensure_mounted() {
-    local disks expected
-    mapfile -t disks < <(find_local_disks)
-    (( ${#disks[@]} > 0 )) || die "no NVMe disk with model '$NVME_MODEL' found"
+    local disks expected source
+    source=$(host_mount_source)
+    [[ -n "$source" ]] || guard_mountpoint
+
+    local listed
+    listed=$(local_disks)
+    mapfile -t disks <<< "$listed"
     log "Local NVMe disks: ${disks[*]}"
 
     expected=$(expected_device "${disks[@]}")
     if is_mounted_correctly "$expected"; then
         log "$MOUNT_POINT is already mounted from $expected on the host"
+    elif [[ -n "$source" ]]; then
+        die "$MOUNT_POINT on the host is mounted from $source, not from the local NVMe disks; refusing to touch it"
     else
         prepare_device "${disks[@]}"
         expected=$(expected_device "${disks[@]}")
@@ -199,10 +226,10 @@ ensure_mounted() {
 }
 
 main() {
-    local mode=${1:-} disks
+    local mode=${1:-} disks misses
     if [[ "$mode" == "--check" ]]; then
-        mapfile -t disks < <(find_local_disks)
-        (( ${#disks[@]} > 0 )) || exit 1
+        mapfile -t disks < <(find_local_disks || true)
+        [[ -n "${disks[0]:-}" ]] || exit 1
         is_mounted_correctly "$(expected_device "${disks[@]}")"
         exit $?
     fi
@@ -213,9 +240,15 @@ main() {
 
     # The mount belongs to the host, but keep watching it: if it disappears, drop the
     # label and exit so the restarted pod mounts it again.
+    misses=0
     while true; do
         sleep "$CHECK_INTERVAL"
-        is_mounted_correctly "$EXPECTED_DEVICE" || die "$MOUNT_POINT is no longer mounted from $EXPECTED_DEVICE"
+        if is_mounted_correctly "$EXPECTED_DEVICE"; then
+            misses=0
+        else
+            misses=$((misses + 1))
+            (( misses < 2 )) || die "$MOUNT_POINT is no longer mounted from $EXPECTED_DEVICE"
+        fi
     done
 }
 

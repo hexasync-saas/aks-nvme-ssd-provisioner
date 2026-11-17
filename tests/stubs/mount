@@ -1,3 +1,3 @@
 #!/bin/bash
 . "$(dirname "$0")/_lib"; record "$@"
-args=("$@"); echo "${args[-2]}" > "$STATE/mount"
+args=("$@"); echo "${args[-2]}" >> "$STATE/mount"; echo "${args[-1]}" > "$STATE/mountpoint"
