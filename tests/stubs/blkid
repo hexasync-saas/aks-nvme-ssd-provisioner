@@ -1,0 +1,5 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+dev=${!#}; f="$STATE/fs/${dev##*/}"
+[[ -s "$f" ]] && { cat "$f"; exit 0; }
+exit 2
