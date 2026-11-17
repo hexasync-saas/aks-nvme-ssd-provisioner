@@ -41,7 +41,7 @@ add_array() {
 }
 
 run() {
-    OUT=$(timeout 10 env PATH="$ROOT/tests/stubs:$PATH" HOST_EXEC="" MOUNT_POINT="$T/hx-disks" \
+    OUT=$(timeout 10 env PATH="$ROOT/tests/stubs:$PATH" HOST_EXEC="$ROOT/tests/stubs/hostns" MOUNT_POINT="$T/hx-disks" \
         NODE_NAME=node-a CHECK_INTERVAL=0 bash "$SCRIPT" "$@" 2>&1)
     CODE=$?
 }
@@ -85,6 +85,8 @@ test_active_array_not_mounted_is_mounted_without_format() {
     check "array not mounted: mounts /dev/md0" called "mount -o defaults,noatime,discard /dev/md0 $T/hx-disks"
     check "array not mounted: never formats" bash -c '! grep -qE "^(mkfs.ext4|mdadm --create)" "$STATE/calls"'
     check "array not mounted: dir made immutable before mount" immutable_before_mount
+    check "array not mounted: mount and its check run in the host namespace" \
+        bash -c 'grep -qx "hostns mount" "$STATE/calls" && grep -qx "hostns findmnt" "$STATE/calls" && grep -qx "hostns chattr" "$STATE/calls"'
 }
 
 # After a reboot where the kernel did not assemble the array: every disk carries an md

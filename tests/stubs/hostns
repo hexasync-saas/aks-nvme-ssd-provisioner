@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stands in for "nsenter -t 1 -m --": records which commands were sent to the host.
+. "$(dirname "$0")/_lib"; record "$1"
+exec "$@"
