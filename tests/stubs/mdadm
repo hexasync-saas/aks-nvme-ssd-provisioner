@@ -1,0 +1,13 @@
+#!/bin/bash
+. "$(dirname "$0")/_lib"; record "$@"
+case "$1" in
+  --examine) [[ -e "$STATE/sb/${2##*/}" ]] ;;
+  --assemble|--create)
+    md=""; disks=()
+    for a in "${@:2}"; do
+      case "$a" in /dev/md*) md=${a##*/} ;; /dev/*) disks+=("${a##*/}") ;; esac
+    done
+    mkdir -p "$SYSFS/block/$md/slaves"
+    for d in "${disks[@]}"; do touch "$SYSFS/block/$md/slaves/$d" "$STATE/sb/$d"; done ;;
+  *) exit 1 ;;
+esac

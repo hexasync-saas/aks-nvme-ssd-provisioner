@@ -37,11 +37,18 @@ spec:
   selector:
     matchLabels:
       name: aks-nvme-ssd-provisioner
+  # Replace pods one node at a time by hand (kubectl delete pod), checking Longhorn
+  # between nodes; an update never restarts every node's provisioner at once.
+  updateStrategy:
+    type: OnDelete
   template:
     metadata:
       labels:
         name: aks-nvme-ssd-provisioner
     spec:
+      # The mount is made in the host mount namespace (nsenter -t 1), so it does not
+      # depend on this pod's lifetime.
+      hostPID: true
       serviceAccountName: nvme-provisioner-sa
       automountServiceAccountToken: true # Must be true to label nodes
       nodeSelector:
@@ -49,7 +56,7 @@ spec:
       priorityClassName: system-node-critical
       containers:
         - name: aks-nvme-ssd-provisioner
-          image: hexasyncregistry.azurecr.io/hexasync/aks-nvme-ssd-provisioner:202602281522
+          image: hexasyncregistry.azurecr.io/hexasync/aks-nvme-ssd-provisioner:202611171200 # not built yet
           imagePullPolicy: Always
           securityContext:
             privileged: true # Required for mounting host drives
@@ -58,11 +65,9 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: spec.nodeName
-          volumeMounts:
-            - mountPath: /hx-disks
-              name: hx-disks
-              mountPropagation: "Bidirectional"
-      volumes:
-        - name: hx-disks
-          hostPath:
-            path: /hx-disks
+          # Ready only while /hx-disks on the host is mounted from the local NVMe array.
+          readinessProbe:
+            exec:
+              command: ["aks-nvme-ssd-provisioner.sh", "--check"]
+            periodSeconds: 30
+            failureThreshold: 2

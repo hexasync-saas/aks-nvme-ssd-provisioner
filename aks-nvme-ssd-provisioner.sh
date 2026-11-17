@@ -1,151 +1,222 @@
 #!/bin/bash
+# Prepares the local NVMe disks of an AKS node as one ext4 filesystem mounted at
+# $MOUNT_POINT in the HOST mount namespace (Longhorn's disk path).
+#
+# Rules this script keeps:
+# - The mount is made in the host mount namespace (nsenter, needs hostPID), so it
+#   does not depend on this pod's lifetime and survives a pod restart or rollout.
+# - "Already mounted" is decided by the HOST's mount table, never by the
+#   container's view: inside the container the hostPath volume is always a
+#   mountpoint, which is how /hx-disks ended up on the OS disk unnoticed.
+# - Existing data is never formatted. An array or filesystem that already exists is
+#   assembled/mounted; anything unexpected (a signature on a non-member disk, a
+#   partial array, a non-ext4 array, a foreign mount) stops the script with an error.
+# - While nothing is mounted, the host directory is made immutable so nothing
+#   (Longhorn) can write onto the OS disk underneath the mountpoint.
+#
+# Usage: aks-nvme-ssd-provisioner.sh            ensure mounted, then keep watching
+#        aks-nvme-ssd-provisioner.sh --once     ensure mounted, then exit
+#        aks-nvme-ssd-provisioner.sh --check    exit 0 only if mounted correctly (readiness probe)
 
 set -o errexit
 set -o nounset
 set -o pipefail
+shopt -s nullglob
 
-# --- CONFIGURATION ---
 RAID_DEVICE=${RAID_DEVICE:-/dev/md0}
 RAID_CHUNK_SIZE=${RAID_CHUNK_SIZE:-512}
 FILESYSTEM_BLOCK_SIZE=${FILESYSTEM_BLOCK_SIZE:-4096}
-MOUNT_POINT="/hx-disks"
-# NODE_NAME is passed from the Downward API in the DaemonSet spec
-NODE_NAME=${NODE_NAME:-""}
+MOUNT_POINT=${MOUNT_POINT:-/hx-disks}
+NVME_MODEL=${NVME_MODEL:-Microsoft NVMe Direct Disk}
+NODE_NAME=${NODE_NAME:-}
+NODE_LABEL=${NODE_LABEL:-nvme-storage-ready}
+CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+SYSFS=${SYSFS:-/sys}
+EXPECTED_DEVICE=""
+# Prefix that runs a command in the host mount namespace.
+read -r -a HOST <<< "${HOST_EXEC-nsenter -t 1 -m --}"
 
-echo "-----------------------------------------------------------"
-echo "Starting Hexasync NVMe SSD Provisioner (UUID Mode)..."
-echo "Target Node: ${NODE_NAME:-Unknown}"
-echo "-----------------------------------------------------------"
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
-# --- 1. SMART FILTERING ---
-echo "Step 1: Scanning for strictly unused NVMe disks..."
+label_node() {
+    [[ -n "$NODE_NAME" ]] || return 0
+    kubectl label node "$NODE_NAME" "$1" --overwrite >/dev/null || log "WARNING: could not set node label '$1'"
+}
 
-UNUSED_DISKS=()
-# Get all raw NVMe disks (e.g., /dev/nvme0n1, /dev/nvme1n1)
-ALL_NVME=$(lsblk -pnro NAME,TYPE | grep 'disk' | grep 'nvme' | awk '{print $1}')
-
-for dev in $ALL_NVME; do
-    # A. Skip nvme0n1 specifically (Azure OS disk safety)
-    if [[ "$dev" == *"/nvme0n1" ]]; then
-        echo "   [SKIP] $dev: Identified as System/OS disk."
-        continue
-    fi
-
-    # B. Count children (partitions). If > 1, it has partitions.
-    CHILD_COUNT=$(lsblk -nlo NAME "$dev" | wc -l)
-    
-    # C. Check for existing Filesystem or Mountpoint
-    HAS_FS=$(lsblk -no FSTYPE "$dev" | tr -d '[:space:]')
-    IS_MOUNTED=$(lsblk -no MOUNTPOINT "$dev" | tr -d '[:space:]')
-
-    if [[ "$CHILD_COUNT" -eq 1 ]] && [[ -z "$HAS_FS" ]] && [[ -z "$IS_MOUNTED" ]]; then
-        echo "   [OK]   $dev: Disk is clean and available."
-        UNUSED_DISKS+=("$dev")
-    else
-        echo "   [SKIP] $dev: Contains partitions or active filesystem."
-    fi
-done
-
-SSD_NVME_DEVICE_COUNT=${#UNUSED_DISKS[@]}
-
-# --- 2. PRE-FLIGHT CHECKS ---
-if [[ $SSD_NVME_DEVICE_COUNT -eq 0 ]]; then
-    echo "No unused NVMe disks found."
-    
-    # Verify if we are already mounted to a RAID device
-    if mountpoint -q "$MOUNT_POINT"; then
-        echo "Notice: $MOUNT_POINT is already mounted. Checking capacity..."
-        df -h "$MOUNT_POINT"
-        
-        # Even if already mounted, try to ensure the label exists
-        if [[ -n "$NODE_NAME" ]]; then
-             echo "Ensuring node label is present..."
-             kubectl label node "$NODE_NAME" nvme-storage-ready=true --overwrite || echo "Labeling failed, continuing..."
-        fi
-        sleep infinity
-    fi
-    exit 0
-fi
-
-echo "Step 2: Found $SSD_NVME_DEVICE_COUNT devices to use: ${UNUSED_DISKS[*]}"
-
-# --- 3. PROVISIONING ---
-echo "Step 3: Cleaning old metadata and wiping signatures..."
-# Force stop existing raid if it's currently defined
-mdadm --stop "$RAID_DEVICE" || true
-
-for dev in "${UNUSED_DISKS[@]}"; do
-    echo "       Wiping $dev..."
-    mdadm --zero-superblock "$dev" || true
-    wipefs -a "$dev"
-done
-
-# Wait for wipes to settle in the kernel
-udevadm settle
-
-if [[ $SSD_NVME_DEVICE_COUNT -eq 1 ]]; then
-    echo "Step 4: Single disk detected. Formatting..."
-    mkfs.ext4 -F -m 0 -b $FILESYSTEM_BLOCK_SIZE "${UNUSED_DISKS[0]}"
-    TARGET_DEV="${UNUSED_DISKS[0]}"
-else
-    echo "Step 4: Multiple disks detected. Creating RAID 0..."
-    mdadm --create --run --verbose "$RAID_DEVICE" --level=0 -c ${RAID_CHUNK_SIZE} \
-        --raid-devices=${SSD_NVME_DEVICE_COUNT} "${UNUSED_DISKS[@]}"
-    
-    # Wait for the /dev/md0 node to exist
-    udevadm settle
-
-    # Calculate RAID optimization (Stride and Stripe-width)
-    STRIDE=$(expr $RAID_CHUNK_SIZE \* 1024 / $FILESYSTEM_BLOCK_SIZE || true)
-    STRIPE_WIDTH=$(expr $SSD_NVME_DEVICE_COUNT \* $STRIDE || true)
-
-    echo "Step 5: Formatting RAID device $RAID_DEVICE with Ext4..."
-    mkfs.ext4 -F -m 0 -b $FILESYSTEM_BLOCK_SIZE -E stride=$STRIDE,stripe-width=$STRIPE_WIDTH "$RAID_DEVICE"
-    TARGET_DEV="$RAID_DEVICE"
-fi
-
-# --- 4. MOUNTING BY UUID ---
-echo "Step 6: Mounting by UUID..."
-udevadm settle
-
-# Capture the UUID of the newly formatted device
-DEVICE_UUID=$(blkid -s UUID -o value "$TARGET_DEV")
-
-if [[ -z "$DEVICE_UUID" ]]; then
-    echo "ERROR: Could not find UUID for $TARGET_DEV. Formatting may have failed."
+die() {
+    log "ERROR: $*"
+    label_node "${NODE_LABEL}-"
     exit 1
-fi
+}
 
-mkdir -p "$MOUNT_POINT"
+# Local (ephemeral) NVMe disks, chosen by model so the OS disk is never a candidate
+# whatever its device number.
+find_local_disks() {
+    local dir model
+    for dir in "$SYSFS"/block/nvme*n1; do
+        model=$(tr -s ' ' < "$dir/device/model" | sed 's/ *$//')
+        if [[ "$model" == "$NVME_MODEL"* ]]; then
+            echo "/dev/${dir##*/}"
+        fi
+    done
+}
 
-# Unmount any "ghost" mounts from previous failed attempts
-umount -l "$MOUNT_POINT" || true
+# md device (as /dev/mdX) built from any of the given disks, empty if none.
+find_array() {
+    local md slave disk
+    for md in "$SYSFS"/block/md*; do
+        for slave in "$md"/slaves/*; do
+            for disk in "$@"; do
+                if [[ "/dev/${slave##*/}" == "$disk" ]]; then
+                    echo "/dev/${md##*/}"
+                    return 0
+                fi
+            done
+        done
+    done
+}
 
-echo "   Mounting UUID=$DEVICE_UUID to $MOUNT_POINT..."
-mount -U "$DEVICE_UUID" "$MOUNT_POINT" -o defaults,noatime,discard
+array_member_count() {
+    local slaves=("$SYSFS/block/${1##*/}"/slaves/*)
+    echo "${#slaves[@]}"
+}
 
-# Ensure pods have write access
-chmod 777 "$MOUNT_POINT"
+has_partitions() {
+    local parts=("$SYSFS/block/${1##*/}/${1##*/}"p*)
+    (( ${#parts[@]} > 0 ))
+}
 
-# --- 5. NODE LABELING ---
-echo "Step 7: Labeling node in Kubernetes..."
-if [[ -n "$NODE_NAME" ]]; then
-    if command -v kubectl >/dev/null 2>&1; then
-        echo "   Labeling node $NODE_NAME with nvme-storage-ready=true..."
-        kubectl label node "$NODE_NAME" nvme-storage-ready=true --overwrite
-    else
-        echo "   [WARNING] kubectl not found in container. Skipping labeling."
-        echo "   Ensure your Dockerfile installs kubectl to enable this feature."
+# Low-level probe (-p) reads the device itself; lsblk's FSTYPE needs the udev
+# database, which the container does not have, so it always reads empty here.
+signature() { blkid -p -s TYPE -o value "$1" 2>/dev/null || true; }
+
+host_mount_source() { "${HOST[@]}" findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT" 2>/dev/null || true; }
+
+expected_device() {
+    local disks=("$@") array
+    array=$(find_array "${disks[@]}")
+    if [[ -n "$array" ]]; then
+        echo "$array"
+    elif (( ${#disks[@]} == 1 )); then
+        echo "${disks[0]}"
     fi
-else
-    echo "   [SKIP] NODE_NAME env var not set. Cannot label node."
-fi
+}
 
-echo "-----------------------------------------------------------"
-echo "SUCCESS: Device UUID $DEVICE_UUID mounted at $MOUNT_POINT"
-echo "Internal Verification:"
-df -Th "$MOUNT_POINT"
-echo "-----------------------------------------------------------"
+is_mounted_correctly() {
+    local expected=$1 source
+    source=$(host_mount_source)
+    [[ -n "$expected" && "$source" == "$expected" ]]
+}
 
-# Keep the container alive for mount propagation
-sleep infinity
+create_filesystem() {
+    local disks=("$@") disk stride stripe_width
+    for disk in "${disks[@]}"; do
+        if has_partitions "$disk"; then die "$disk has partitions; refusing to wipe it"; fi
+        if [[ -n "$(signature "$disk")" ]]; then
+            die "$disk has a '$(signature "$disk")' signature but is not part of an array; refusing to wipe it"
+        fi
+    done
+
+    log "All ${#disks[@]} local NVMe disks are blank: creating the filesystem"
+    if (( ${#disks[@]} == 1 )); then
+        mkfs.ext4 -m 0 -b "$FILESYSTEM_BLOCK_SIZE" "${disks[0]}"
+        return 0
+    fi
+    mdadm --create --run --verbose "$RAID_DEVICE" --level=0 -c "$RAID_CHUNK_SIZE" \
+        --raid-devices="${#disks[@]}" "${disks[@]}"
+    udevadm settle || true
+    stride=$(( RAID_CHUNK_SIZE * 1024 / FILESYSTEM_BLOCK_SIZE ))
+    stripe_width=$(( ${#disks[@]} * stride ))
+    mkfs.ext4 -m 0 -b "$FILESYSTEM_BLOCK_SIZE" -E "stride=$stride,stripe-width=$stripe_width" "$RAID_DEVICE"
+}
+
+# Brings the disks to a state with exactly one device holding the filesystem.
+prepare_device() {
+    local disks=("$@") disk with_superblock=0 array
+
+    array=$(find_array "${disks[@]}")
+    if [[ -n "$array" ]]; then
+        if [[ "$(array_member_count "$array")" -ne ${#disks[@]} ]]; then
+            die "$array has $(array_member_count "$array") members but there are ${#disks[@]} local NVMe disks; refusing to guess"
+        fi
+        log "Found existing array $array"
+        return 0
+    fi
+
+    for disk in "${disks[@]}"; do
+        if mdadm --examine "$disk" >/dev/null 2>&1; then with_superblock=$((with_superblock + 1)); fi
+    done
+
+    if (( with_superblock == ${#disks[@]} )); then
+        log "All disks carry an md superblock: assembling the existing array (no format)"
+        mdadm --assemble --run "$RAID_DEVICE" "${disks[@]}"
+        udevadm settle || true
+    elif (( with_superblock > 0 )); then
+        die "$with_superblock of ${#disks[@]} disks carry an md superblock; refusing to guess"
+    else
+        create_filesystem "${disks[@]}"
+    fi
+}
+
+mount_on_host() {
+    local device=$1 fstype source
+    fstype=$(signature "$device")
+    [[ "$fstype" == "ext4" ]] || die "$device holds '${fstype:-no filesystem}', expected ext4; refusing to format existing data"
+
+    source=$(host_mount_source)
+    if [[ -n "$source" ]]; then
+        die "$MOUNT_POINT on the host is mounted from $source, not from $device; refusing to touch it"
+    fi
+
+    "${HOST[@]}" mkdir -p "$MOUNT_POINT"
+    # Immutable while unmounted: a write that would land on the OS disk now fails.
+    "${HOST[@]}" chattr +i "$MOUNT_POINT" || log "WARNING: could not make $MOUNT_POINT immutable"
+    "${HOST[@]}" mount -o defaults,noatime,discard "$device" "$MOUNT_POINT"
+    is_mounted_correctly "$device" || die "mounted $device but the host reports $MOUNT_POINT from '$(host_mount_source)'"
+    "${HOST[@]}" chmod 777 "$MOUNT_POINT"
+    log "Mounted $device at $MOUNT_POINT on the host"
+}
+
+# Sets EXPECTED_DEVICE to the device mounted at $MOUNT_POINT.
+ensure_mounted() {
+    local disks expected
+    mapfile -t disks < <(find_local_disks)
+    (( ${#disks[@]} > 0 )) || die "no NVMe disk with model '$NVME_MODEL' found"
+    log "Local NVMe disks: ${disks[*]}"
+
+    expected=$(expected_device "${disks[@]}")
+    if is_mounted_correctly "$expected"; then
+        log "$MOUNT_POINT is already mounted from $expected on the host"
+    else
+        prepare_device "${disks[@]}"
+        expected=$(expected_device "${disks[@]}")
+        [[ -n "$expected" ]] || die "no device holds the filesystem after preparing the disks"
+        mount_on_host "$expected"
+    fi
+    "${HOST[@]}" df -h "$MOUNT_POINT" || true
+    label_node "${NODE_LABEL}=true"
+    EXPECTED_DEVICE=$expected
+}
+
+main() {
+    local mode=${1:-} disks
+    if [[ "$mode" == "--check" ]]; then
+        mapfile -t disks < <(find_local_disks)
+        (( ${#disks[@]} > 0 )) || exit 1
+        is_mounted_correctly "$(expected_device "${disks[@]}")"
+        exit $?
+    fi
+
+    log "Starting HexaSync NVMe SSD provisioner on ${NODE_NAME:-unknown node}"
+    ensure_mounted
+    [[ "$mode" == "--once" ]] && exit 0
+
+    # The mount belongs to the host, but keep watching it: if it disappears, drop the
+    # label and exit so the restarted pod mounts it again.
+    while true; do
+        sleep "$CHECK_INTERVAL"
+        is_mounted_correctly "$EXPECTED_DEVICE" || die "$MOUNT_POINT is no longer mounted from $EXPECTED_DEVICE"
+    done
+}
+
+main "$@"

@@ -1,0 +1,4 @@
+#!/bin/bash
+# The monitor loop sleeps between checks: simulate the host losing the mount.
+. "$(dirname "$0")/_lib"; record "$@"
+rm -f "$STATE/mount"

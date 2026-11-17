@@ -1,0 +1,2 @@
+# Shared by the stubs: every call is appended to $STATE/calls.
+record() { echo "$(basename "$0") $*" >> "$STATE/calls"; }
