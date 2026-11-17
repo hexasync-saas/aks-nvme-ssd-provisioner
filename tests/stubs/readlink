@@ -1,0 +1,4 @@
+#!/bin/bash
+# hostPID: PID 1 is in another mount namespace. $STATE/no-hostpid = PID 1 is this container's own.
+. "$(dirname "$0")/_lib"; record "$@"
+if [[ -e "$STATE/no-hostpid" || "$1" != /proc/1/* ]]; then echo "mnt:[2]"; else echo "mnt:[1]"; fi

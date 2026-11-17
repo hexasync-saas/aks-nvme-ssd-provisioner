@@ -1,4 +1,6 @@
 #!/bin/bash
+# $STATE/mount = the container's view of /hx-disks, $STATE/hostmount = the host's (findmnt -N 1).
 . "$(dirname "$0")/_lib"; record "$@"
-[[ -s "$STATE/mount" ]] || exit 1
-cat "$STATE/mount"
+view="$STATE/mount"; [[ " $* " == *" -N 1 "* ]] && view="$STATE/hostmount"
+[[ -s "$view" ]] || exit 1
+cat "$view"

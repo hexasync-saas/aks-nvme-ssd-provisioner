@@ -1,3 +1,6 @@
 #!/bin/bash
+# A mount on /hx-disks reaches the host only while the hostPath bind is still underneath it.
 . "$(dirname "$0")/_lib"; record "$@"
-if [[ "$1" == -U ]]; then raid > "$STATE/mount"; else echo "$1" > "$STATE/mount"; fi
+dev=$1; [[ "$1" == -U ]] && dev=$(raid)
+grep -qF '[/hx-disks]' "$STATE/mount" 2>/dev/null && echo "$dev" >> "$STATE/hostmount"
+echo "$dev" >> "$STATE/mount"
