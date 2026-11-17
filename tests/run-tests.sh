@@ -41,12 +41,20 @@ add_array() {
 }
 
 run() {
-    OUT=$(env PATH="$ROOT/tests/stubs:$PATH" HOST_EXEC="" MOUNT_POINT="$T/hx-disks" \
+    OUT=$(timeout 10 env PATH="$ROOT/tests/stubs:$PATH" HOST_EXEC="" MOUNT_POINT="$T/hx-disks" \
         NODE_NAME=node-a CHECK_INTERVAL=0 bash "$SCRIPT" "$@" 2>&1)
     CODE=$?
 }
 
 called() { grep -q -- "$1" "$STATE/calls"; }
+
+# chattr +i on the mountpoint must be recorded, and before the mount call.
+immutable_before_mount() {
+    local c m
+    c=$(grep -n "^chattr +i $T/hx-disks" "$STATE/calls" | head -1 | cut -d: -f1)
+    m=$(grep -n "^mount " "$STATE/calls" | head -1 | cut -d: -f1)
+    [[ -n "$c" && -n "$m" && "$c" -lt "$m" ]]
+}
 
 check() {
     local name=$1; shift
@@ -76,8 +84,7 @@ test_active_array_not_mounted_is_mounted_without_format() {
     check "array not mounted: exit 0" test "$CODE" -eq 0
     check "array not mounted: mounts /dev/md0" called "mount -o defaults,noatime,discard /dev/md0 $T/hx-disks"
     check "array not mounted: never formats" bash -c '! grep -qE "^(mkfs.ext4|mdadm --create)" "$STATE/calls"'
-    check "array not mounted: dir made immutable before mount" \
-        bash -c 'grep -n "^chattr +i" "$STATE/calls" | head -1 | cut -d: -f1 | { read c; m=$(grep -n "^mount " "$STATE/calls" | cut -d: -f1); [[ $c -lt $m ]]; }'
+    check "array not mounted: dir made immutable before mount" immutable_before_mount
 }
 
 # After a reboot where the kernel did not assemble the array: every disk carries an md
