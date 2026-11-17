@@ -176,7 +176,6 @@ mount_on_host() {
     log "Mounted $device at $MOUNT_POINT on the host"
 }
 
-# Sets EXPECTED_DEVICE to the device mounted at $MOUNT_POINT.
 # Runs while nothing is mounted at $MOUNT_POINT on the host, before anything that can
 # fail: from here on a write to $MOUNT_POINT fails instead of landing on the OS disk.
 guard_mountpoint() {
@@ -199,12 +198,12 @@ local_disks() {
     echo "$out"
 }
 
+# Sets EXPECTED_DEVICE to the device mounted at $MOUNT_POINT.
 ensure_mounted() {
-    local disks expected source
+    local disks expected source listed
     source=$(host_mount_source)
     [[ -n "$source" ]] || guard_mountpoint
 
-    local listed
     listed=$(local_disks)
     mapfile -t disks <<< "$listed"
     log "Local NVMe disks: ${disks[*]}"
